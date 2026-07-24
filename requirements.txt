@@ -1,0 +1,23 @@
+# ============================================================================
+# MGM Barcode Generator — Dependencies
+# ============================================================================
+
+# Core barcode generation
+fpdf2>=2.8.0
+python-barcode>=0.15.1
+Pillow>=11.0.0
+
+# Data handling
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# ── GUI Versions ──
+
+# Tkinter GUI (desktop app) — drag & drop support
+tkinterdnd2>=0.6.2
+
+# Streamlit GUI (web app) — browser-based
+streamlit>=1.40.0
+
+# Git tracker sync (Streamlit version)
+gitpython>=3.1.30

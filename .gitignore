@@ -1,0 +1,58 @@
+# ============================================================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ============================================================================
+# Temp files
+*.tmp
+*.bak
+barcodes_*/
+barcode_output/
+barcode_output_test/
+barcode_auto_test/
+barcode_division_test/
+barcode_streamlit_test/
+
+# ============================================================================
+# Uploaded Excel files (local runs)
+upload/
+
+# ============================================================================
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================================
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ============================================================================
+# Generated outputs (re-generated each run)
+barcode_output/
+barcode_tracker_local/
+
+# ============================================================================
+# Python virtual env
+venv/
+.venv/
+env/
+
+# ============================================================================
+# Streamlit secrets (keep local)
+.secrets.toml
+
+# ============================================================================
+# Excel input files (user provides their own)
+*.xlsx
+*.xls
+*.csv
+
+# ============================================================================
+# Keep the tracker — it's the critical uniqueness record!
+!barcode_tracker.json
