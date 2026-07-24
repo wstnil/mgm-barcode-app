@@ -549,8 +549,7 @@ with st.sidebar:
 
     git_repo_url = st.text_input(
         "Git Repo URL",
-        value="",
-        placeholder="https://github.com/your-org/mgm-barcode-tracker",
+        value="https://github.com/wstnil/mgm-barcode-app",
         help="Enter the HTTPS URL of your Git repo where barcode_tracker.json will be synced."
     )
 
