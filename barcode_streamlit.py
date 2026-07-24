@@ -106,18 +106,27 @@ class BarcodeTracker:
 # GIT SYNC — PULL / PUSH TRACKER TO REPO
 # ============================================================================
 class GitTrackerSync:
-    """Clone/pull tracker from a Git repo, and push updates after generation."""
+    """Clone/pull tracker from a Git repo, and push updates after generation.
+    Uses PAT token from Streamlit secrets for authentication."""
 
-    def __init__(self, repo_url, local_dir):
+    def __init__(self, repo_url, local_dir, pat_token=None):
         self.repo_url = repo_url
         self.local_dir = local_dir
         self.repo = None
+        # Build authenticated URL with PAT token
+        self.pat_token = pat_token
+        if self.pat_token:
+            self.auth_url = f"https://{self.pat_token}@github.com/{repo_url.replace('https://github.com/', '')}"
+        else:
+            self.auth_url = repo_url
 
     def clone_or_pull(self):
         """Clone if not exists, else pull latest."""
         if os.path.isdir(os.path.join(self.local_dir, ".git")):
             try:
                 self.repo = git.Repo(self.local_dir)
+                # Update remote URL with PAT
+                self.repo.remotes.origin.set_url(self.auth_url)
                 origin = self.repo.remotes.origin
                 origin.pull("main")
                 return True, "Pulled latest tracker from Git"
@@ -125,8 +134,8 @@ class GitTrackerSync:
                 return False, f"Git pull failed: {e}"
         else:
             try:
-                self.repo = git.Repo.clone_from(self.repo_url, self.local_dir, branch="main")
-                return True, f"Cloned tracker repo from {self.repo_url}"
+                self.repo = git.Repo.clone_from(self.auth_url, self.local_dir, branch="main")
+                return True, f"Cloned tracker repo"
             except Exception as e:
                 return False, f"Git clone failed: {e}"
 
@@ -134,6 +143,7 @@ class GitTrackerSync:
         """Commit and push updated tracker file."""
         try:
             self.repo = git.Repo(self.local_dir)
+            self.repo.remotes.origin.set_url(self.auth_url)
             self.repo.git.add("--all")
             self.repo.index.commit(commit_msg)
             origin = self.repo.remotes.origin
@@ -555,9 +565,16 @@ with st.sidebar:
 
     git_branch = st.text_input("Branch", value="main")
 
+    # Get PAT token from secrets (for Streamlit Cloud deployment)
+    pat_token = None
+    try:
+        pat_token = st.secrets["github"]["pat_token"]
+    except Exception:
+        pat_token = None  # Running locally without secrets
+
     if git_repo_url:
         git_local_dir = os.path.join(tempfile.gettempdir(), "mgm_barcode_tracker_repo")
-        git_sync = GitTrackerSync(git_repo_url, git_local_dir)
+        git_sync = GitTrackerSync(git_repo_url, git_local_dir, pat_token=pat_token)
 
         if st.button("⬇ Pull Tracker from Git", use_container_width=True):
             success, msg = git_sync.clone_or_pull()
@@ -756,13 +773,19 @@ if st.session_state.generated and st.session_state.result:
         )
 
         if st.button("⬆ Push Tracker to Git", use_container_width=True):
-            git_sync = GitTrackerSync(git_repo_url, os.path.join(tempfile.gettempdir(), "mgm_barcode_tracker_repo"))
+            # Get PAT from secrets again for push
+            push_pat = None
+            try:
+                push_pat = st.secrets["github"]["pat_token"]
+            except Exception:
+                push_pat = None
+            git_sync = GitTrackerSync(git_repo_url, os.path.join(tempfile.gettempdir(), "mgm_barcode_tracker_repo"), pat_token=push_pat)
             success, msg = git_sync.push(commit_msg)
             if success:
                 st.success(f"✅ {msg}")
             else:
                 st.error(f"❌ {msg}")
-                st.caption("Make sure Git credentials (SSH key or HTTPS token) are configured on this machine.")
+                st.caption("Make sure Git credentials (SSH key or PAT token in secrets) are configured.")
 
     # ── Reset button ──
     st.markdown("---")
