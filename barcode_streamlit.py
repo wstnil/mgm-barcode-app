@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-MGM Barcode Generator — Streamlit Web App
+MGM Barcode Generator — Streamlit Web App (Cloud-Ready)
 Auto-generates unique barcode numbers. Tracker synced via Git repo.
-Run: streamlit run barcode_streamlit.py
+Deploy: https://streamlit.io/cloud → connect repo → set secrets
+Run locally: streamlit run barcode_streamlit.py
 """
 
 import os
 import re
 import json
+import zipfile
 import tempfile
 import shutil
 import time
-import subprocess
+import io
 import pandas as pd
 from fpdf import FPDF
 from barcode import Code128
 from barcode.writer import ImageWriter
 
 import streamlit as st
-import git
 
 # ============================================================================
 # PAGE CONFIG — MGM BRANDING
@@ -103,52 +104,68 @@ class BarcodeTracker:
 
 
 # ============================================================================
-# GIT SYNC — PULL / PUSH TRACKER TO REPO
+# GIT SYNC — PULL / PUSH TRACKER TO REPO (Cloud-Compatible)
 # ============================================================================
 class GitTrackerSync:
     """Clone/pull tracker from a Git repo, and push updates after generation.
-    Uses PAT token from Streamlit secrets for authentication."""
+    Uses PAT token from Streamlit secrets for authentication.
+    Works on Streamlit Cloud (ephemeral filesystem) and locally."""
 
     def __init__(self, repo_url, local_dir, pat_token=None):
         self.repo_url = repo_url
         self.local_dir = local_dir
         self.repo = None
-        # Build authenticated URL with PAT token
         self.pat_token = pat_token
+        # Build authenticated URL with PAT token
         if self.pat_token:
-            self.auth_url = f"https://{self.pat_token}@github.com/{repo_url.replace('https://github.com/', '')}"
+            # Strip any trailing slash from repo_url
+            clean_url = repo_url.rstrip("/")
+            repo_path = clean_url.replace("https://github.com/", "")
+            self.auth_url = f"https://{self.pat_token}@github.com/{repo_path}"
         else:
             self.auth_url = repo_url
 
     def clone_or_pull(self):
         """Clone if not exists, else pull latest."""
+        import git
         if os.path.isdir(os.path.join(self.local_dir, ".git")):
             try:
                 self.repo = git.Repo(self.local_dir)
-                # Update remote URL with PAT
                 self.repo.remotes.origin.set_url(self.auth_url)
                 origin = self.repo.remotes.origin
                 origin.pull("main")
                 return True, "Pulled latest tracker from Git"
             except Exception as e:
-                return False, f"Git pull failed: {e}"
+                # If pull fails, try fresh clone
+                try:
+                    shutil.rmtree(self.local_dir, ignore_errors=True)
+                    self.repo = git.Repo.clone_from(self.auth_url, self.local_dir, branch="main")
+                    return True, "Fresh clone (pull failed, re-cloned)"
+                except Exception as e2:
+                    return False, f"Git clone failed: {e2}"
         else:
             try:
+                os.makedirs(self.local_dir, exist_ok=True)
                 self.repo = git.Repo.clone_from(self.auth_url, self.local_dir, branch="main")
-                return True, f"Cloned tracker repo"
+                return True, "Cloned tracker repo"
             except Exception as e:
                 return False, f"Git clone failed: {e}"
 
     def push(self, commit_msg="Update barcode tracker"):
         """Commit and push updated tracker file."""
+        import git
         try:
             self.repo = git.Repo(self.local_dir)
             self.repo.remotes.origin.set_url(self.auth_url)
             self.repo.git.add("--all")
-            self.repo.index.commit(commit_msg)
-            origin = self.repo.remotes.origin
-            origin.push("main")
-            return True, "Pushed tracker update to Git"
+            # Check if there's anything to commit
+            if self.repo.is_dirty(untracked_files=True):
+                self.repo.index.commit(commit_msg)
+                origin = self.repo.remotes.origin
+                origin.push("main")
+                return True, "Pushed tracker update to Git"
+            else:
+                return True, "No changes to push"
         except Exception as e:
             return False, f"Git push failed: {e}"
 
@@ -175,9 +192,6 @@ PAGE_MARGIN_TOP = 7.5
 HORIZONTAL_GAP = 0.0
 VERTICAL_GAP = -0.5
 
-TEMP_DIR = tempfile.mkdtemp(prefix="barcodes_")
-barcode_cache = {}
-
 
 class PDF(FPDF):
     def header(self): pass
@@ -194,78 +208,125 @@ def normalize_date(val):
     except (ValueError, TypeError):
         return "Unknown_Date"
 
-def get_barcode(data):
-    original_data = str(data).strip()
-    cache_key = safe_filename(original_data)
-    if cache_key in barcode_cache:
-        return barcode_cache[cache_key]
-    code = Code128(original_data, writer=ImageWriter())
-    temp_path = os.path.join(TEMP_DIR, cache_key)
-    path = code.save(temp_path, {
-        "module_width": 0.25, "module_height": 8,
-        "font_size": 0, "text_distance": -100
-    })
-    barcode_cache[cache_key] = path
-    return path
 
-def get_position(i):
-    row = i // COLUMNS_PER_PAGE
-    col = i % COLUMNS_PER_PAGE
-    x = PAGE_MARGIN_LEFT + col * (LABEL_WIDTH + HORIZONTAL_GAP)
-    y = PAGE_MARGIN_TOP + row * (LABEL_HEIGHT + VERTICAL_GAP)
-    return x, y
+def generate(input_file, output_dir, tracker_path):
+    """Generate barcode labels with auto-generated unique numbers."""
 
+    TEMP_DIR = tempfile.mkdtemp(prefix="barcodes_")
+    barcode_cache = {}
 
-def draw_label(pdf, row, x, y, auto_barcode):
-    seat = str(row.get("Seat_No", "")).strip()[:15]
-    sub = str(row.get("Subject_Code", "")).strip()[:15]
-    date_val = str(row.get("Date", "")).strip()
+    def get_barcode(data):
+        original_data = str(data).strip()
+        cache_key = safe_filename(original_data)
+        if cache_key in barcode_cache:
+            return barcode_cache[cache_key]
+        code = Code128(original_data, writer=ImageWriter())
+        temp_path = os.path.join(TEMP_DIR, cache_key)
+        path = code.save(temp_path, {
+            "module_width": 0.25, "module_height": 8,
+            "font_size": 0, "text_distance": -100
+        })
+        barcode_cache[cache_key] = path
+        return path
 
-    sem_val = row.get("Semester", "")
-    if isinstance(sem_val, pd.Series): sem_val = sem_val.iloc[0]
-    sem_val = str(sem_val).strip()
-    if sem_val.endswith(".0"): sem_val = sem_val[:-2]
-    if sem_val.lower() == "nan": sem_val = ""
-    sem_val = sem_val[:10]
+    def get_position(i):
+        row = i // COLUMNS_PER_PAGE
+        col = i % COLUMNS_PER_PAGE
+        x = PAGE_MARGIN_LEFT + col * (LABEL_WIDTH + HORIZONTAL_GAP)
+        y = PAGE_MARGIN_TOP + row * (LABEL_HEIGHT + VERTICAL_GAP)
+        return x, y
 
-    center_val = row.get("Exam Center Code", row.get("Center", ""))
-    if isinstance(center_val, pd.Series): center_val = center_val.iloc[0]
-    center_val = str(center_val).strip()
-    if center_val.endswith(".0"): center_val = center_val[:-2]
-    if center_val.lower() == "nan": center_val = ""
-    center_val = center_val[:10]
+    tracker = BarcodeTracker(tracker_path)
+    df = load_data(input_file)
 
-    program_val = row.get("Program", "")
-    if isinstance(program_val, pd.Series): program_val = program_val.iloc[0]
-    program_val = str(program_val).strip()
-    if program_val.lower() == "nan": program_val = ""
-    program_val = program_val[:15]
+    for col in ["Exam Center Code", "Exam_Session", "Subject_Code"]:
+        if col not in df.columns:
+            df[col] = "Unknown"
 
-    sticker = auto_barcode
+    df["Exam Center Code"] = df["Exam Center Code"].replace("", "Unknown_Center")
+    df["Exam_Session"] = df["Exam_Session"].replace("", "Unknown_Session")
+    df["Subject_Code"] = df["Subject_Code"].replace("", "Unknown_Subject")
 
-    barcode_w = 56.0
-    barcode_h = 11.5
-    barcode_x = x + (LABEL_WIDTH - barcode_w) / 2
-    barcode_y = y + 15.1
+    if "Seat_No" in df.columns:
+        df["Seat_No_Str"] = df["Seat_No"].astype(str)
+        df["Seat_No_Num"] = pd.to_numeric(df["Seat_No_Str"], errors='coerce').fillna(float('inf'))
+        df = df.sort_values(by=["Subject_Code", "Seat_No_Num", "Seat_No_Str"]).drop(columns=["Seat_No_Num", "Seat_No_Str"])
 
-    pdf.set_font("Helvetica", "B", 7.5)
-    top_text_x = x + 3.5
-    top_text_w = LABEL_WIDTH - 7.0
+    total_rows = len(df)
+    auto_barcodes = tracker.allocate_batch(total_rows)
+    first_bc = auto_barcodes[0]
+    last_bc = auto_barcodes[-1]
+    df["auto_barcode"] = auto_barcodes
 
-    pdf.set_xy(top_text_x, y + 8)
-    pdf.cell(top_text_w, 3.5, f"PRN: {seat}      Date: {date_val}", align="C")
-    pdf.set_xy(top_text_x, y + 11.5)
-    pdf.cell(top_text_w, 3.5, f"Sub: {sub}    Sem: {sem_val}    Center: {center_val}", align="C")
+    log_data = []
+    total_labels = 0
+    generated_pdf_files = []
 
-    barcode_path = get_barcode(sticker)
-    pdf.image(barcode_path, x=barcode_x, y=barcode_y, w=barcode_w, h=barcode_h)
+    for center in df["Exam Center Code"].unique():
+        center_df = df[df["Exam Center Code"] == center]
+        center_folder = safe_filename(center)
 
-    pdf.set_xy(x, y + 27.0)
-    pdf.set_font("Helvetica", "B", 8)
-    bottom_text = sticker
-    if program_val:
-        bottom_text = f"{sticker}    Program: {program_val}"
-    pdf.cell(LABEL_WIDTH, 4.0, bottom_text, align="C")
+        for date in center_df["Date"].unique():
+            date_df = center_df[center_df["Date"] == date]
+            date_folder = safe_filename(date)
+
+            for session in date_df["Exam_Session"].unique():
+                session_df = date_df[date_df["Exam_Session"] == session]
+                session_folder = safe_filename(session)
+
+                folder = os.path.join(output_dir, center_folder, date_folder, session_folder)
+                os.makedirs(folder, exist_ok=True)
+
+                pdf = PDF(orientation="P", unit="mm", format="A4")
+                pdf.set_auto_page_break(auto=False)
+                pdf.add_page()
+
+                count = 0
+                for _, row in session_df.iterrows():
+                    i = count % LABELS_PER_PAGE
+                    if i == 0 and count != 0:
+                        pdf.add_page()
+                    x, y = get_position(i)
+                    draw_label(pdf, row, x, y, row["auto_barcode"], get_barcode)
+                    count += 1
+
+                file_path = os.path.join(folder, f"{session_folder}_All_Subjects.pdf")
+                pdf.output(file_path)
+                generated_pdf_files.append(file_path)
+                total_labels += count
+
+                log_data.append({
+                    "Center": center,
+                    "Date": date,
+                    "Session": session,
+                    "Total_Subjects": len(session_df["Subject_Code"].unique()),
+                    "Total_Students": len(session_df),
+                    "Barcodes_Generated": count,
+                    "First_Barcode": session_df["auto_barcode"].iloc[0],
+                    "Last_Barcode": session_df["auto_barcode"].iloc[-1],
+                    "PDF_Filename": os.path.basename(file_path)
+                })
+
+    # Save barcode mapping CSV
+    mapping_df = df[["Seat_No", "Subject_Code", "Date", "auto_barcode"]].copy()
+    mapping_df.rename(columns={"Seat_No": "PRN", "auto_barcode": "Barcode_No"}, inplace=True)
+    mapping_path = os.path.join(output_dir, "barcode_mapping.csv")
+    mapping_df.to_csv(mapping_path, index=False)
+    generated_pdf_files.append(mapping_path)
+
+    # Record in tracker
+    tracker.record_generation(input_file, total_rows, first_bc, last_bc)
+
+    # Save generation log
+    shutil.rmtree(TEMP_DIR, ignore_errors=True)
+
+    if log_data:
+        log_df = pd.DataFrame(log_data)
+        log_path = os.path.join(output_dir, "generation_log.csv")
+        log_df.to_csv(log_path, index=False)
+        generated_pdf_files.append(log_path)
+
+    return total_labels, len(log_data), log_data, first_bc, last_bc, mapping_df, generated_pdf_files
 
 
 def load_data(input_file):
@@ -317,103 +378,76 @@ def load_data(input_file):
     return df
 
 
-def generate(input_file, output_dir, tracker_path):
-    """Generate barcode labels with auto-generated unique numbers."""
+def draw_label(pdf, row, x, y, auto_barcode, get_barcode_fn):
+    seat = str(row.get("Seat_No", "")).strip()[:15]
+    sub = str(row.get("Subject_Code", "")).strip()[:15]
+    date_val = str(row.get("Date", "")).strip()
 
-    global TEMP_DIR, barcode_cache
-    TEMP_DIR = tempfile.mkdtemp(prefix="barcodes_")
-    barcode_cache = {}
+    sem_val = row.get("Semester", "")
+    if isinstance(sem_val, pd.Series): sem_val = sem_val.iloc[0]
+    sem_val = str(sem_val).strip()
+    if sem_val.endswith(".0"): sem_val = sem_val[:-2]
+    if sem_val.lower() == "nan": sem_val = ""
+    sem_val = sem_val[:10]
 
-    tracker = BarcodeTracker(tracker_path)
-    df = load_data(input_file)
+    center_val = row.get("Exam Center Code", row.get("Center", ""))
+    if isinstance(center_val, pd.Series): center_val = center_val.iloc[0]
+    center_val = str(center_val).strip()
+    if center_val.endswith(".0"): center_val = center_val[:-2]
+    if center_val.lower() == "nan": center_val = ""
+    center_val = center_val[:10]
 
-    for col in ["Exam Center Code", "Exam_Session", "Subject_Code"]:
-        if col not in df.columns:
-            df[col] = "Unknown"
+    program_val = row.get("Program", "")
+    if isinstance(program_val, pd.Series): program_val = program_val.iloc[0]
+    program_val = str(program_val).strip()
+    if program_val.lower() == "nan": program_val = ""
+    program_val = program_val[:15]
 
-    df["Exam Center Code"] = df["Exam Center Code"].replace("", "Unknown_Center")
-    df["Exam_Session"] = df["Exam_Session"].replace("", "Unknown_Session")
-    df["Subject_Code"] = df["Subject_Code"].replace("", "Unknown_Subject")
+    sticker = auto_barcode
 
-    if "Seat_No" in df.columns:
-        df["Seat_No_Str"] = df["Seat_No"].astype(str)
-        df["Seat_No_Num"] = pd.to_numeric(df["Seat_No_Str"], errors='coerce').fillna(float('inf'))
-        df = df.sort_values(by=["Subject_Code", "Seat_No_Num", "Seat_No_Str"]).drop(columns=["Seat_No_Num", "Seat_No_Str"])
+    barcode_w = 56.0
+    barcode_h = 11.5
+    barcode_x = x + (LABEL_WIDTH - barcode_w) / 2
+    barcode_y = y + 15.1
 
-    total_rows = len(df)
-    auto_barcodes = tracker.allocate_batch(total_rows)
-    first_bc = auto_barcodes[0]
-    last_bc = auto_barcodes[-1]
-    df["auto_barcode"] = auto_barcodes
+    pdf.set_font("Helvetica", "B", 7.5)
+    top_text_x = x + 3.5
+    top_text_w = LABEL_WIDTH - 7.0
 
-    log_data = []
-    total_labels = 0
+    pdf.set_xy(top_text_x, y + 8)
+    pdf.cell(top_text_w, 3.5, f"PRN: {seat}      Date: {date_val}", align="C")
+    pdf.set_xy(top_text_x, y + 11.5)
+    pdf.cell(top_text_w, 3.5, f"Sub: {sub}    Sem: {sem_val}    Center: {center_val}", align="C")
 
-    for center in df["Exam Center Code"].unique():
-        center_df = df[df["Exam Center Code"] == center]
-        center_folder = safe_filename(center)
+    barcode_path = get_barcode_fn(sticker)
+    pdf.image(barcode_path, x=barcode_x, y=barcode_y, w=barcode_w, h=barcode_h)
 
-        for date in center_df["Date"].unique():
-            date_df = center_df[center_df["Date"] == date]
-            date_folder = safe_filename(date)
-
-            for session in date_df["Exam_Session"].unique():
-                session_df = date_df[date_df["Exam_Session"] == session]
-                session_folder = safe_filename(session)
-
-                folder = os.path.join(output_dir, center_folder, date_folder, session_folder)
-                os.makedirs(folder, exist_ok=True)
-
-                pdf = PDF(orientation="P", unit="mm", format="A4")
-                pdf.set_auto_page_break(auto=False)
-                pdf.add_page()
-
-                count = 0
-                for _, row in session_df.iterrows():
-                    i = count % LABELS_PER_PAGE
-                    if i == 0 and count != 0:
-                        pdf.add_page()
-                    x, y = get_position(i)
-                    draw_label(pdf, row, x, y, row["auto_barcode"])
-                    count += 1
-
-                file_path = os.path.join(folder, f"{session_folder}_All_Subjects.pdf")
-                pdf.output(file_path)
-                total_labels += count
-
-                log_data.append({
-                    "Center": center,
-                    "Date": date,
-                    "Session": session,
-                    "Total_Subjects": len(session_df["Subject_Code"].unique()),
-                    "Total_Students": len(session_df),
-                    "Barcodes_Generated": count,
-                    "First_Barcode": session_df["auto_barcode"].iloc[0],
-                    "Last_Barcode": session_df["auto_barcode"].iloc[-1]
-                })
-
-    # Save barcode mapping CSV
-    mapping_df = df[["Seat_No", "Subject_Code", "Date", "auto_barcode"]].copy()
-    mapping_df.rename(columns={"Seat_No": "PRN", "auto_barcode": "Barcode_No"}, inplace=True)
-    mapping_path = os.path.join(output_dir, "barcode_mapping.csv")
-    mapping_df.to_csv(mapping_path, index=False)
-
-    # Record in tracker
-    tracker.record_generation(input_file, total_rows, first_bc, last_bc)
-
-    # Save generation log
-    shutil.rmtree(TEMP_DIR, ignore_errors=True)
-
-    if log_data:
-        log_df = pd.DataFrame(log_data)
-        log_path = os.path.join(output_dir, "generation_log.csv")
-        log_df.to_csv(log_path, index=False)
-
-    return total_labels, len(log_data), log_data, first_bc, last_bc, mapping_df
+    pdf.set_xy(x, y + 27.0)
+    pdf.set_font("Helvetica", "B", 8)
+    bottom_text = sticker
+    if program_val:
+        bottom_text = f"{sticker}    Program: {program_val}"
+    pdf.cell(LABEL_WIDTH, 4.0, bottom_text, align="C")
 
 
 # ============================================================================
-# CUSTOM CSS — MGM DARK THEME
+# HELPER — Create ZIP of generated files
+# ============================================================================
+def create_zip_of_files(file_list, zip_name="barcode_output.zip"):
+    """Create a ZIP file in memory from a list of file paths."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for fpath in file_list:
+            if os.path.isfile(fpath):
+                # Keep relative structure inside zip
+                arcname = os.path.relpath(fpath, os.path.commonpath(file_list))
+                zf.write(fpath, arcname)
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+# ============================================================================
+# CUSTOM CSS — MGM DARK THEME (Enhanced for Cloud)
 # ============================================================================
 st.markdown("""
 <style>
@@ -521,15 +555,25 @@ st.markdown("""
     .stSidebar .stTextInput > div > div > input {
         background: #1a1a2e; color: #eaeaea;
     }
+
+    /* ── Download buttons ── */
+    .stDownloadButton > button {
+        background: #0f3460 !important;
+        color: #d4a843 !important;
+        border: 1px solid #d4a843 !important;
+        border-radius: 8px !important;
+    }
+    .stDownloadButton > button:hover {
+        background: #16213e !important;
+        color: #e8c547 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ============================================================================
-# STREAMLIT APP
+# SESSION STATE INIT
 # ============================================================================
-
-# ── SESSION STATE INIT ──
 if "generated" not in st.session_state:
     st.session_state.generated = False
 if "result" not in st.session_state:
@@ -538,9 +582,27 @@ if "git_synced" not in st.session_state:
     st.session_state.git_synced = False
 if "tracker_path" not in st.session_state:
     st.session_state.tracker_path = None
+if "auto_pulled" not in st.session_state:
+    st.session_state.auto_pulled = False
 
 
-# ── HEADER ──
+# ============================================================================
+# GIT CONFIG — Auto-sync on cloud
+# ============================================================================
+# Get PAT token from secrets (for Streamlit Cloud deployment)
+pat_token = None
+try:
+    pat_token = st.secrets["github"]["pat_token"]
+except Exception:
+    pat_token = None  # Running locally without secrets
+
+git_repo_url = "https://github.com/wstnil/mgm-barcode-app"
+git_local_dir = os.path.join(tempfile.gettempdir(), "mgm_barcode_tracker_repo")
+
+
+# ============================================================================
+# HEADER
+# ============================================================================
 st.markdown("""
 <div class="mgm-header">
     <div>
@@ -552,113 +614,115 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── SIDEBAR ── Git Tracker Configuration
+# ============================================================================
+# AUTO-INIT TRACKER (Pull from Git on first load)
+# ============================================================================
+if not st.session_state.auto_pulled:
+    with st.spinner("Syncing tracker from Git repo..."):
+        git_sync = GitTrackerSync(git_repo_url, git_local_dir, pat_token=pat_token)
+        success, msg = git_sync.clone_or_pull()
+        if success:
+            st.session_state.tracker_path = git_sync.get_tracker_path()
+            st.session_state.git_synced = True
+            st.session_state.auto_pulled = True
+            st.toast(f"Tracker synced: {msg}", icon="✅")
+        else:
+            # Fallback to local tracker if git fails
+            local_tracker_dir = os.path.join(tempfile.gettempdir(), "mgm_barcode_tracker_local")
+            os.makedirs(local_tracker_dir, exist_ok=True)
+            local_tracker_path = os.path.join(local_tracker_dir, TRACKER_FILE)
+            st.session_state.tracker_path = local_tracker_path
+            st.session_state.auto_pulled = True
+            st.toast(f"Git sync failed — using local tracker. {msg}", icon="⚠️")
+
+
+# ============================================================================
+# SIDEBAR — Git Tracker & Stats
+# ============================================================================
 with st.sidebar:
     st.markdown("### 🔗 Git Tracker Repo")
-    st.caption("Sync barcode tracker to a Git repo for cross-machine uniqueness.")
+    st.caption("Barcode tracker is auto-synced from this repo for uniqueness guarantee.")
 
-    git_repo_url = st.text_input(
-        "Git Repo URL",
-        value="https://github.com/wstnil/mgm-barcode-app",
-        help="Enter the HTTPS URL of your Git repo where barcode_tracker.json will be synced."
-    )
+    st.text_input("Repo URL", value=git_repo_url, disabled=True)
+    st.text_input("Branch", value="main", disabled=True)
 
-    git_branch = st.text_input("Branch", value="main")
+    sync_status = "✅ Synced" if st.session_state.git_synced else "⚠️ Local fallback"
+    st.info(f"Tracker status: **{sync_status}**")
 
-    # Get PAT token from secrets (for Streamlit Cloud deployment)
-    pat_token = None
-    try:
-        pat_token = st.secrets["github"]["pat_token"]
-    except Exception:
-        pat_token = None  # Running locally without secrets
-
-    if git_repo_url:
-        git_local_dir = os.path.join(tempfile.gettempdir(), "mgm_barcode_tracker_repo")
+    # Manual re-sync button
+    if st.button("🔄 Re-sync Tracker from Git", use_container_width=True):
         git_sync = GitTrackerSync(git_repo_url, git_local_dir, pat_token=pat_token)
+        success, msg = git_sync.clone_or_pull()
+        if success:
+            st.session_state.tracker_path = git_sync.get_tracker_path()
+            st.session_state.git_synced = True
+            st.success(msg)
+        else:
+            st.error(msg)
 
-        if st.button("⬇ Pull Tracker from Git", use_container_width=True):
-            success, msg = git_sync.clone_or_pull()
-            if success:
-                st.session_state.tracker_path = git_sync.get_tracker_path()
-                st.session_state.git_synced = True
-                st.success(msg)
-            else:
-                st.error(msg)
-
-        if st.session_state.git_synced:
-            tracker_path = st.session_state.tracker_path
-            tracker = BarcodeTracker(tracker_path)
-            stats = tracker.get_stats()
-
-            st.markdown("---")
-            st.markdown("### 📊 Tracker Stats")
-            col1, col2 = st.columns(2)
-            col1.metric("Issued", f"{stats['total_generated']}")
-            col2.metric("Last Barcode", stats['last_barcode'])
-            col1.metric("Next Barcode", stats['next_barcode'])
-            col2.metric("Remaining", f"{stats['remaining_numbers']}")
-            col1.metric("History Runs", f"{stats['history_runs']}")
-
-            # Show history
-            if tracker.data["history"]:
-                st.markdown("---")
-                st.markdown("### 📜 Generation History")
-                hist_df = pd.DataFrame(tracker.data["history"])
-                st.dataframe(hist_df, use_container_width=True, height=200)
-    else:
-        # No git repo — use local tracker
-        st.markdown("---")
-        st.markdown("### 📂 Local Tracker")
-        local_tracker_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", "barcode_tracker_local")
-        os.makedirs(local_tracker_dir, exist_ok=True)
-        local_tracker_path = os.path.join(local_tracker_dir, TRACKER_FILE)
-        st.session_state.tracker_path = local_tracker_path
-
-        tracker = BarcodeTracker(local_tracker_path)
+    # ── Tracker Stats ──
+    tracker_path = st.session_state.tracker_path
+    if tracker_path:
+        tracker = BarcodeTracker(tracker_path)
         stats = tracker.get_stats()
 
+        st.markdown("---")
+        st.markdown("### 📊 Tracker Stats")
         col1, col2 = st.columns(2)
-        col1.metric("Issued", f"{stats['total_generated']}")
+        col1.metric("Total Issued", f"{stats['total_generated']}")
         col2.metric("Last Barcode", stats['last_barcode'])
         col1.metric("Next Barcode", stats['next_barcode'])
-        col2.metric("Remaining", f"{stats['remaining_numbers']}")
+        col2.metric("Remaining", f"{stats['remaining_numbers']:,}")
+        col1.metric("History Runs", f"{stats['history_runs']}")
 
+        # Show history
         if tracker.data["history"]:
             st.markdown("---")
             st.markdown("### 📜 Generation History")
             hist_df = pd.DataFrame(tracker.data["history"])
-            st.dataframe(hist_df, use_container_width=True, height=200)
+            st.dataframe(hist_df, use_container_width=True, height=250)
+
+    # ── PAT Token Setup Info ──
+    st.markdown("---")
+    st.markdown("### 🔐 Secrets Setup")
+    if pat_token:
+        st.success("PAT token configured in secrets")
+    else:
+        st.warning("No PAT token found. Add `github.pat_token` in Streamlit Cloud secrets.")
 
 
-# ── MAIN AREA ──
+# ============================================================================
+# MAIN AREA
+# ============================================================================
 
-# Tracker stats banner
-tracker_path = st.session_state.tracker_path or os.path.join(
-    os.path.dirname(os.path.abspath(__file__)) or ".", "barcode_tracker_local", TRACKER_FILE
-)
-tracker = BarcodeTracker(tracker_path)
-stats = tracker.get_stats()
+# Tracker stats banner at top
+tracker_path = st.session_state.tracker_path
+if tracker_path:
+    tracker = BarcodeTracker(tracker_path)
+    stats = tracker.get_stats()
 
-st.markdown("""
-<div class="tracker-card">
-    <h3>UNIQUE BARCODE TRACKER</h3>
-</div>
-""", unsafe_allow_html=True)
+    st.markdown("""
+    <div class="tracker-card">
+        <h3>UNIQUE BARCODE TRACKER</h3>
+    </div>
+    """, unsafe_allow_html=True)
 
-tc1, tc2, tc3, tc4 = st.columns(4)
-tc1.metric("Total Issued", f"{stats['total_generated']}", delta=None)
-tc2.metric("Last Barcode", stats['last_barcode'])
-tc3.metric("Next Barcode", stats['next_barcode'])
-tc4.metric("Remaining Pool", f"{stats['remaining_numbers']}")
+    tc1, tc2, tc3, tc4 = st.columns(4)
+    tc1.metric("Total Issued", f"{stats['total_generated']}", delta=None)
+    tc2.metric("Last Barcode", stats['last_barcode'])
+    tc3.metric("Next Barcode", stats['next_barcode'])
+    tc4.metric("Remaining Pool", f"{stats['remaining_numbers']:,}")
 
 st.markdown("---")
 
-# ── File Upload Section ──
+# ============================================================================
+# FILE UPLOAD
+# ============================================================================
 st.markdown('<p class="section-title">📁 UPLOAD EXCEL FILE</p>', unsafe_allow_html=True)
 uploaded_file = st.file_uploader(
     "Drag & drop or click to upload your Excel file",
     type=["xlsx", "xls", "csv"],
-    help="Required columns: Seat_No/PRN, Subject_Code, Date"
+    help="Required columns: Seat_No/PRN, Subject_Code, Date. Optional: Semester, Exam Center Code, Program"
 )
 
 if uploaded_file:
@@ -680,17 +744,14 @@ if uploaded_file:
         st.error(f"Error reading file: {e}")
         temp_input = None
 
-    # ── Output Settings ──
-    st.markdown('<p class="section-title">⚙️ OUTPUT SETTINGS</p>', unsafe_allow_html=True)
-    output_dir = st.text_input(
-        "Output Folder Path",
-        value=os.path.join(os.path.dirname(os.path.abspath(__file__)) or ".", "barcode_output"),
-        help="Where generated PDFs and logs will be saved"
-    )
+    # Output dir — always use temp on cloud
+    output_dir = os.path.join(tempfile.gettempdir(), "barcode_output")
 
     st.markdown("---")
 
-    # ── GENERATE BUTTON ──
+    # ============================================================================
+    # GENERATE BUTTON
+    # ============================================================================
     st.markdown('<p class="section-title">🚀 GENERATE BARCODES</p>', unsafe_allow_html=True)
 
     generate_clicked = st.button(
@@ -701,9 +762,9 @@ if uploaded_file:
     )
 
     if generate_clicked and temp_input:
-        with st.spinner("🔄 Generating unique barcode labels..."):
+        with st.spinner("🔄 Generating unique barcode labels... This may take a minute for large files."):
             try:
-                total_labels, num_pdfs, log_data, first_bc, last_bc, mapping_df = generate(
+                total_labels, num_pdfs, log_data, first_bc, last_bc, mapping_df, pdf_files = generate(
                     temp_input, output_dir, tracker_path
                 )
                 st.session_state.generated = True
@@ -714,6 +775,7 @@ if uploaded_file:
                     "first_bc": first_bc,
                     "last_bc": last_bc,
                     "mapping_df": mapping_df,
+                    "pdf_files": pdf_files,
                     "output_dir": output_dir,
                     "tracker_path": tracker_path
                 }
@@ -722,7 +784,9 @@ if uploaded_file:
                 st.session_state.generated = False
 
 
-# ── RESULTS SECTION ──
+# ============================================================================
+# RESULTS SECTION
+# ============================================================================
 if st.session_state.generated and st.session_state.result:
     result = st.session_state.result
 
@@ -739,18 +803,82 @@ if st.session_state.generated and st.session_state.result:
 
     st.markdown("---")
 
-    # Generation log table
+    # ============================================================================
+    # DOWNLOAD SECTION — ZIP + Individual files
+    # ============================================================================
+    st.markdown('<p class="section-title">⬇️ DOWNLOAD FILES</p>', unsafe_allow_html=True)
+
+    # ZIP download (all files bundled)
+    pdf_files = result.get("pdf_files", [])
+    if pdf_files:
+        # Create a cleaner ZIP structure
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fpath in pdf_files:
+                if os.path.isfile(fpath):
+                    # Use the relative path from output_dir for clean structure
+                    try:
+                        arcname = os.path.relpath(fpath, result["output_dir"])
+                    except ValueError:
+                        arcname = os.path.basename(fpath)
+                    zf.write(fpath, arcname)
+        zip_buffer.seek(0)
+        zip_bytes = zip_buffer.getvalue()
+
+        st.download_button(
+            "📦 Download ALL Files (ZIP)",
+            data=zip_bytes,
+            file_name="barcode_output.zip",
+            mime="application/zip",
+            use_container_width=True
+        )
+
+    # Individual PDF downloads
+    st.markdown('<p class="section-title">📄 Individual PDF Downloads</p>', unsafe_allow_html=True)
+    pdf_only = [f for f in pdf_files if f.endswith(".pdf") and os.path.isfile(f)]
+    if pdf_only:
+        for pdf_path in pdf_only:
+            try:
+                rel_name = os.path.relpath(pdf_path, result["output_dir"])
+            except ValueError:
+                rel_name = os.path.basename(pdf_path)
+            with open(pdf_path, "rb") as pf:
+                pdf_bytes = pf.read()
+            st.download_button(
+                f"📄 {rel_name}",
+                data=pdf_bytes,
+                file_name=os.path.basename(pdf_path),
+                mime="application/pdf"
+            )
+
+    st.markdown("---")
+
+    # ============================================================================
+    # GENERATION LOG
+    # ============================================================================
     st.markdown('<p class="section-title">📊 GENERATION LOG</p>', unsafe_allow_html=True)
     log_df = pd.DataFrame(result["log_data"])
     st.dataframe(log_df, use_container_width=True)
 
+    # Log CSV download
+    log_csv = log_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇ Download Generation Log CSV",
+        data=log_csv,
+        file_name="generation_log.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
     st.markdown("---")
 
-    # Barcode mapping table
+    # ============================================================================
+    # BARCODE MAPPING
+    # ============================================================================
     st.markdown('<p class="section-title">🔗 BARCODE MAPPING (PRN → Barcode)</p>', unsafe_allow_html=True)
     st.dataframe(result["mapping_df"], use_container_width=True)
 
-    # Download mapping CSV
+    # Mapping CSV download
     csv_bytes = result["mapping_df"].to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇ Download Barcode Mapping CSV",
@@ -762,10 +890,12 @@ if st.session_state.generated and st.session_state.result:
 
     st.markdown("---")
 
-    # ── Git Push Section ──
-    if git_repo_url and st.session_state.git_synced:
+    # ============================================================================
+    # GIT PUSH — Auto-push tracker update
+    # ============================================================================
+    if st.session_state.git_synced:
         st.markdown('<p class="section-title">☁️ PUSH TRACKER TO GIT</p>', unsafe_allow_html=True)
-        st.info("Push the updated tracker to your Git repo so other machines stay synced.")
+        st.info("Push the updated tracker to your Git repo so the next session stays synced.")
 
         commit_msg = st.text_input(
             "Commit Message",
@@ -773,33 +903,34 @@ if st.session_state.generated and st.session_state.result:
         )
 
         if st.button("⬆ Push Tracker to Git", use_container_width=True):
-            # Get PAT from secrets again for push
-            push_pat = None
-            try:
-                push_pat = st.secrets["github"]["pat_token"]
-            except Exception:
-                push_pat = None
-            git_sync = GitTrackerSync(git_repo_url, os.path.join(tempfile.gettempdir(), "mgm_barcode_tracker_repo"), pat_token=push_pat)
+            git_sync = GitTrackerSync(git_repo_url, git_local_dir, pat_token=pat_token)
             success, msg = git_sync.push(commit_msg)
             if success:
                 st.success(f"✅ {msg}")
             else:
                 st.error(f"❌ {msg}")
-                st.caption("Make sure Git credentials (SSH key or PAT token in secrets) are configured.")
+                if not pat_token:
+                    st.caption("No PAT token found. Add `github.pat_token` in Streamlit Cloud → Settings → Secrets.")
 
-    # ── Reset button ──
+    # ============================================================================
+    # Reset button
+    # ============================================================================
     st.markdown("---")
     if st.button("🔄 Reset — Generate Another File", use_container_width=True):
+        # Clean up temp output
+        shutil.rmtree(result.get("output_dir", ""), ignore_errors=True)
         st.session_state.generated = False
         st.session_state.result = None
         st.rerun()
 
 
-# ── FOOTER ──
+# ============================================================================
+# FOOTER
+# ============================================================================
 st.markdown("---")
 st.markdown("""
 <div style="text-align:center; padding:12px; color:#6b6b80; font-size:11px;">
     <b>A4ST24S</b> · 3×8 · 69.8×35mm · Code128 · Auto Unique · Git-Synced<br>
-    <b>MGM University</b> · Exam Barcode System
+    <b>MGM University</b> · Exam Barcode System · Public Access
 </div>
 """, unsafe_allow_html=True)

@@ -1,5 +1,5 @@
 # ============================================================================
-# MGM Barcode Generator — Dependencies
+# MGM Barcode Generator — Dependencies (Streamlit Cloud Compatible)
 # ============================================================================
 
 # Core barcode generation
@@ -11,13 +11,8 @@ Pillow>=11.0.0
 pandas>=2.0.0
 openpyxl>=3.1.0
 
-# ── GUI Versions ──
-
-# Tkinter GUI (desktop app) — drag & drop support
-tkinterdnd2>=0.6.2
-
-# Streamlit GUI (web app) — browser-based
+# Streamlit web app
 streamlit>=1.40.0
 
-# Git tracker sync (Streamlit version)
+# Git tracker sync
 gitpython>=3.1.30
