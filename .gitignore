@@ -44,8 +44,9 @@ venv/
 env/
 
 # ============================================================================
-# Streamlit secrets (keep local)
+# Streamlit secrets (keep local — contains PAT token)
 .secrets.toml
+.streamlit/secrets.toml
 
 # ============================================================================
 # Excel input files (user provides their own)
